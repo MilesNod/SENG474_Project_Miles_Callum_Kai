@@ -1,5 +1,5 @@
 export class Fluid {
-    width: number
+    width: number // comment
     height: number
     vx: number[][]
     vy: number[][]
