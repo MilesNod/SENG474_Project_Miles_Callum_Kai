@@ -16,8 +16,8 @@ class SolverConfig:
     """
     This solver represents a square lid-driven cavity - just like the baseline credit
 
-    The stability safety factor must be in (0, 1]. The solver checks the
-    baseline's diffusion timestep bound; this is not an advective CFL check.
+    The stability safety factor must be in (0, 1]. 
+    checks the baseline's diffusion timestep
     """
 
     # Class Variables
