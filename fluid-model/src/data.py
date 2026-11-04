@@ -11,8 +11,9 @@ root_dir = os.path.abspath(os.path.join(current_dir, "..", ".."))
 
 if root_dir not in sys.path:sys.path.insert(0, root_dir)
 
-from src.simulation import SolverConfig, NavierStokesSolver
+from src.simulation import SolverConfig, NavierStokesSolver, FluidState
 
+# I think we can ignore this function if we want, leaving it here just incase
 def make_configs(n, seed):
     """
     n: number of configs that you want
@@ -38,34 +39,55 @@ def make_configs(n, seed):
         configs.append(cfg)
     return configs 
 
+def make_random_initial_state(solver, rng, amplitude):
+    """
+    makes a totally random initial state, might be violent, idk how fluid sims really work
+    """
+    H, W = solver.initial_state().u.shape
+    u = rng.normal(size=(H, W)) * amplitude
+    v = rng.normal(size=(H, W)) * amplitude
+    for f in (u, v):               
+        f[0, :] = f[-1, :] = 0
+        f[:, 0] = f[:, -1] = 0
+    return FluidState(u=u, v=v, p=np.zeros((H, W)))
+
 class FluidDataset(Dataset):
-    def __init__(self, configs=None, num_steps=250, noise = 0.0):
+    def __init__(self, config=None, num_steps=250, noise = 0.0, seed = 3, num_runs = 100, amplitude = 0.1):
         """
+        config: the parameters of the system: will be default as discussed but is some legacy code now
         num_steps: number of steps the solver runs
         noise: amount of noise that you want, 0 is no noise
+        *** NOISE IS ONLY ADDED WHEN getitems IS CALLED TO GET NOISE FOR THAT SPECIFIC STATE ***
+
+        seed: for random seeds
+        num_runs: the amount of seperate runs that we want to do for the fluid sim
+        amplitude: the amount you want it to be randomized, I set it at 0.1 so the results won't be too crazy
+
         self.trajs stores all the data
 
         ex.
-        bazinga = FluidDataset(make_configs(100, 3))
+        bazinga = FluidDataset()
         bazinga.trajs[3, 50]
         returns the 50th state for the 3rd run of the 100 make configs things
         """
         # for base case incase you dont put anything
         # base case is just the default system incase we don't even want to use configs
-        if configs is None:
-            configs = [SolverConfig()]
-        
+        if config is None:
+            config = SolverConfig()
+        solver = NavierStokesSolver(config)
+        rng = np.random.default_rng(seed)
+
+
         trajs = []
-        # for every config put the dataset in trajs
-        for config in configs:
-            solver = NavierStokesSolver(config)
-            states = solver.run(solver.initial_state(), num_steps)
+        # make a fluid sim for every run that we want
+        for run in range(num_runs):
+            s0 = make_random_initial_state(solver, rng, amplitude)
+            states = solver.run(s0, num_steps)
             trajs.append(np.stack([state.to_array().reshape(-1) for state in states]))
 
         self.trajs = np.stack(trajs).astype(np.float32)
         self.noise = noise
         self.num_steps = num_steps
-        self.params = np.array([[c.top_wall_velocity, c.viscosity] for c in configs], dtype=np.float32)
 
         # standard deviation for each of the three fields, adds noise based on how the values of u, v, and p
         # used AI for this as I didn't know how to add noise effectivly
@@ -96,39 +118,36 @@ class FluidDataset(Dataset):
 
         if self.noise > 0:                       # noise for training only
             state = state + self.noise * self.channel_std * torch.randn_like(state)
-
-        # concatenates the parameters that we're working with to the state (top_wall_velocity and viscosity)
-        state = torch.cat([state, torch.from_numpy(self.params[i])]) 
         return state, next_state # return two states based on index and noise
 
-# doing some testing, if I forget to take this out, this is AI
-# def main():
-#     ds = FluidDataset(make_configs(3, 0), num_steps=50)
+    def save(self, path):
+        """
+        saves the data
 
-#     # 1. Is anything nonzero at all?
-#     print("nonzero fraction:", np.count_nonzero(ds.trajs) / ds.trajs.size)
+        ex:
+        bazinga = FluidDataset(num_runs=100, seed=3)
+        bazinga.save("data/train.pt")
+        """
+        torch.save({
+            "trajs": torch.from_numpy(self.trajs),
+            "num_steps": self.num_steps,
+            "noise": self.noise,
+            "channel_std": self.channel_std,
+        }, path)
 
-#     # 2. Does each run develop over time? (frame 0 is zero by design)
-#     for r in range(len(ds.trajs)):
-#         for t in (0, 1, 2, 10, 50):
-#             ch = ds.trajs[r, t].reshape(3, 41, 41)
-#             print(f"run {r} t={t}",
-#                 "max|u|:", round(float(np.abs(ch[0]).max()), 4),
-#                 "max|v|:", round(float(np.abs(ch[1]).max()), 4),
-#                 "max|p|:", round(float(np.abs(ch[2]).max()), 4))
+    @classmethod
+    def load(cls, path, noise=None):
+        """
+        loads the data into trajs and all other relevant variables
 
-#     # 3. Do different runs actually differ? (different lid speed and viscosity)
-#     print("lid speeds:", ds.params[:, 0])
-#     print("u top row, t=50:", [float(ds.trajs[r, 50].reshape(3, 41, 41)[0, -1, 0]) for r in range(3)])
-#     # should match each run's top_wall_velocity
-
-#     # 4. Are the training pairs real? (state != next_state)
-#     x, y = ds[10]
-#     print("pair differs:", not torch.equal(x[:5043], y))
-#     print("diff magnitude:", (y - x[:5043]).abs().max().item())
-
-#     # 5. Is it finite?
-#     print("finite:", np.isfinite(ds.trajs).all())
-
-# if __name__ == "__main__":
-#     main()
+        ex:
+        train = FluidDataset.load("data/train.pt")
+        val = FluidDataset.load("data/val.pt", noise=0.0)
+        """
+        data = torch.load(path)
+        ds = cls.__new__(cls)                      # skip __init__
+        ds.trajs = data["trajs"].numpy()
+        ds.num_steps = data["num_steps"]
+        ds.noise = data["noise"] if noise is None else noise
+        ds.channel_std = data["channel_std"]
+        return ds
