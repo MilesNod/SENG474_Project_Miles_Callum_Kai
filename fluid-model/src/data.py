@@ -80,7 +80,7 @@ class FluidDataset(Dataset):
 
         trajs = []
         # make a fluid sim for every run that we want
-        for run in range(num_runs):
+        for run in range(num_runs-1):
             s0 = make_random_initial_state(solver, rng, amplitude)
             states = solver.run(s0, num_steps)
             trajs.append(np.stack([state.to_array().reshape(-1) for state in states]))
