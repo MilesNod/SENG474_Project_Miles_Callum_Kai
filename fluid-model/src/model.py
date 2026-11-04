@@ -4,11 +4,11 @@ import torch.optim as optim
 from pathlib import Path
 
 class FluidModel(nn.Module):
-    def __init__(self, width: int, height: int):
+    def __init__(self, input_shape: torch.Size, hidden_factor: float = 1):
         super().__init__()
 
-        input_size = (width + 1) * height + width * (height + 1)
-        hidden_size = round(input_size * 1)
+        input_size = input_shape.numel()
+        hidden_size = round(input_size * hidden_factor)
 
         self.flatten = nn.Flatten()
         self.stack = nn.Sequential(

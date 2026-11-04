@@ -3,9 +3,10 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from model import FluidModel
-from data import FluidDataset
+from data import FluidDataset, make_configs
 
-dataset = FluidDataset()
+print("loading dataset... ", end="", flush=True)
+dataset = FluidDataset(num_runs=10)
 data_loader = DataLoader(
     dataset,
     batch_size=8,
@@ -13,8 +14,12 @@ data_loader = DataLoader(
     num_workers=0
 )
 
-model = FluidModel(10, 10)
+print(len(dataset), "samples loaded")
 
+print("loading model...")
+model = FluidModel(torch.Size((41, 41, 3)))
+
+print("training...")
 for epoch in range(50):
     total_loss = 0
 
