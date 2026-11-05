@@ -17,12 +17,12 @@ data_loader = DataLoader(
 )
 print(len(dataset), "samples loaded")
 
-print("loading training dataset... ", end="", flush=True)
+print("loading validation dataset... ", end="", flush=True)
 val_dataset = FluidDataset(num_runs=20, num_steps=50)
 print(len(val_dataset), "samples loaded")
 
 print("loading model...")
-checkpoint_path = Path(__file__).resolve().parents[1] / "weights" / "newest_model.pt"
+checkpoint_path = Path(__file__).resolve().parents[1] / "weights"
 model = FluidModel()
 
 print("training...")
@@ -30,6 +30,7 @@ best_validation = 10e10
 for epoch in range(50):
     progress = tqdm(total=len(data_loader), desc=f"epoch {epoch}")
 
+    model.train()
     total_loss = 0
     for batch_index, (state, next_state) in enumerate(data_loader):
         model.optimizer.zero_grad()
@@ -43,4 +44,26 @@ for epoch in range(50):
         model.optimizer.step()
         progress.update(1)
 
-    model.save("weights/newest_model.pt")
+    model.eval()
+    total_val_loss = 0
+    with torch.no_grad():
+        for state, next_state in val_dataset:
+            state = torch.unsqueeze(state, 0)
+            next_state = torch.unsqueeze(next_state, 0)
+            predicted_state = model(torch.unsqueeze(state, 0))
+            loss: torch.Tensor = model.loss_func(predicted_state, next_state)
+            total_val_loss += loss.item()
+    avg_val_loss = total_loss / len(data_loader)
+
+    if(best_validation == None or best_validation > avg_val_loss):
+        model.save(checkpoint_path / "best_val_model.pt")
+        best_validation = avg_val_loss
+        progress.set_description(f"epoch {epoch} (NEW BEST)")
+
+    progress.set_postfix({
+        "avg_loss": avg_val_loss,
+        "val_loss": total_val_loss / len(val_dataset)
+    })
+    progress.close()
+
+    model.save(checkpoint_path / "newest_model.pt")
