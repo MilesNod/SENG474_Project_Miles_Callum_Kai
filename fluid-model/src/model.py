@@ -22,8 +22,10 @@ class FluidModel(nn.Module):
         self.loss_func = nn.MSELoss()
         self.optimizer = optim.Adam(self.parameters(), lr=0.001)
 
-    def save(self, path: str):
-        torch.save(self.state_dict(), path)
+    def save(self, path: str | Path):
+        checkpoint_path = Path(path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self.state_dict(), checkpoint_path)
 
     def load(self, path: str):
         state_dict = torch.load(path, weights_only=True)

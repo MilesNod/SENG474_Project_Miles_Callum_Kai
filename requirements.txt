@@ -1,0 +1,11 @@
+# For Num Simulation and dataset processing
+numpy
+
+# For NN and training
+torch
+
+# Prog Bars
+tqdm
+
+# Visualization - Not necessary to train model, only if you would like to see the data
+matplotlib

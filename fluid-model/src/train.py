@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -18,6 +20,7 @@ print(len(dataset), "samples loaded")
 
 print("loading model...")
 model = FluidModel(torch.Size((41, 41, 3)))
+checkpoint_path = Path(__file__).resolve().parents[1] / "weights" / "newest_model.pt"
 
 print("training...")
 for epoch in range(50):
@@ -35,4 +38,4 @@ for epoch in range(50):
 
         model.optimizer.step()
 
-    model.save("weights/newest_model.pt")
+    model.save(checkpoint_path)
