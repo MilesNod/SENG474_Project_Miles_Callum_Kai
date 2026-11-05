@@ -1,5 +1,5 @@
-# This is based on the following video as a baseline, ie a code along - just used to get general idea of how some solvers work
-# NOT OUR original works
+# The following code is not ours, see link, it is a code along - just used to get general idea of how some solvers work
+# This is not used in our final implementation, just some parts are used
 # https://www.youtube.com/watch?v=BQLvNLgMTQE&t=5s
 
 # momentum = du/dt + (u * trian) u = -1/p trian*p + v trian^2 * u + f
