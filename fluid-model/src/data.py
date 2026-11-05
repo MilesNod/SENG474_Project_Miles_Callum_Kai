@@ -83,7 +83,7 @@ class FluidDataset(Dataset):
         for run in range(num_runs-1):
             s0 = make_random_initial_state(solver, rng, amplitude)
             states = solver.run(s0, num_steps)
-            trajs.append(np.stack([state.to_array().reshape(-1) for state in states]))
+            trajs.append(np.stack([state.to_array().reshape(3, 41, 41) for state in states]))
 
         self.trajs = np.stack(trajs).astype(np.float32)
         self.noise = noise
