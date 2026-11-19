@@ -19,8 +19,12 @@ def run_baseline(
     config: SolverConfig, num_steps: int
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
     """Run the original numerical loop using the requested matching parameters."""
-    path = Path(__file__).resolve().parents[1] / "nav-stokes-equation-solver" / "nav-stokes-eq.py"
+    # Called by test_solver.py to compare our reusable solver against the code-along.
+    # "Baseline" here means the original numerical solver, not the ML persistence/ridge models.
+    # Steps: read original code -> remove plotting -> use matching constants -> return fields.
+    path = Path(__file__).resolve().parents[1] / "Nav-Stokes-Solver-From-CodeAlong" / "nav-stokes-eq.py"
     module = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
+    # AST is Python's parsed code structure, so we can keep the numerical statements unchanged.
     main = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "main")
     plot_start = next(
         index for index, node in enumerate(main.body)
@@ -30,6 +34,7 @@ def run_baseline(
         and isinstance(node.value.func.value, ast.Name)
         and node.value.func.value.id == "plt"
     )
+    # Unit tests should not open plot windows. Replace the plotting tail with returned arrays.
     main.body = main.body[:plot_start] + [
         ast.Return(value=ast.Tuple(
             elts=[ast.Name(id=name, ctx=ast.Load()) for name in ("u_prev", "v_prev", "p_prev")],
@@ -37,10 +42,12 @@ def run_baseline(
         ))
     ]
     module.body = [node for node in module.body if isinstance(node, ast.Assign)] + [main]
+    # Supply NumPy/progress handling ourselves; the numerical function still comes from the original file.
     ast.fix_missing_locations(module)
     namespace = {"np": np, "tqdm": lambda iterable: iterable}
     exec(compile(module, str(path), "exec"), namespace)
     namespace.update(
+        # Set the same grid, timestep, material parameters, and iteration counts as the solver under test.
         N_POINTS=config.n_points,
         DOMAIN_SIZE=config.domain_size,
         N_ITERATIONS=num_steps,

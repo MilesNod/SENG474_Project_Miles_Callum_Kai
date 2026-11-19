@@ -1,153 +1,216 @@
-"""Compare a saved model with the numerical solver on new initial conditions."""
+"""Evaluate frozen development refits on the reserved final-test trajectories."""
+
+# Run this AFTER train.py has finished selecting/refitting its models.
+# Steps: check saved run -> score true-state inputs -> roll predictions forward -> save results.
+# One-step: we give the model a true solver state for every prediction.
+# Rollout: we give it a true start once, then keep feeding its own output back in.
 
 import argparse
+import json
 from pathlib import Path
+import time
 
 import numpy as np
 import torch
 
-from data import make_random_initial_state
-from model import FluidModel
-from src.simulation import NavierStokesSolver, SolverConfig
+from data import TrajectoryStore, write_json
+from experiment import DEFAULT_RUN, ErrorTotals, FIELDS, environment, resolve_device, score, write_csv
+from model import load_predictor
+from plots import plot_rollouts, save_comparison
+from src.simulation import FluidState, NavierStokesSolver, SolverConfig
 
 
-def field_mse(predicted, expected):
-    """Avg squared errors over samples and grid points, separately for u/v/p."""
-    error = predicted.astype(np.float64) - expected.astype(np.float64)
-    return np.square(error).mean(axis=(0, 2, 3))
+def predict(model, states, parameters, device, batch_size):
+    # Used by rollouts and timing. Process the supplied states in batches to limit GPU memory.
+    # model=None is persistence, so its prediction is a copy of the unchanged current state.
+    if model is None:
+        return states.copy()
+    batches = []
+    with torch.inference_mode():
+        # No weight updates here; tensors only need a forward pass, not gradient tracking.
+        for start in range(0, len(states), batch_size):
+            state = torch.from_numpy(states[start:start + batch_size]).to(device)
+            physical = torch.from_numpy(parameters[start:start + batch_size]).to(device)
+            batches.append(model(state, physical).cpu().numpy())
+    return np.concatenate(batches)
 
 
-def save_comparison(expected, predicted, path, horizon):
-    """Plot the final rollout for the first test trajectory."""
-    import matplotlib
+def rollouts(models, store, ids, std, start, horizons, device, batch_size, output):
+    # Called after one-step scoring to test whether each model can advance a simulation itself.
+    # start: solver timestep to begin from; horizons: how many predicted steps to score.
+    initial = np.stack([store.trajs[run, start] for run in ids])
+    parameters = store.parameters[ids]
+    rows, per_trajectory = [], []
+    comparison_saved = False
+    for name, model in models.items():
+        # Every method starts from the same true states and physical parameters.
+        prediction = initial.copy()
+        unstable_at = None
+        for step in range(1, max(horizons) + 1):
+            if unstable_at is None:
+                # After step 1 this input is our previous prediction, not a fresh solver frame.
+                with np.errstate(over="ignore", invalid="ignore"):
+                    prediction = predict(model, prediction, parameters, device, batch_size)
+                if not np.isfinite(prediction).all():
+                    # Mark the entire method/horizon as failed if any trajectory becomes invalid.
+                    # Dropping only the failed trajectories would make its average look too good.
+                    unstable_at = step
+            if step not in horizons:
+                # Still predict every intermediate step, but only measure the requested horizons.
+                continue
+            row = {"model": name, "horizon": step, "status": "nonfinite" if unstable_at else "finite",
+                   "first_nonfinite_step": unstable_at, "primary": None}
+            for metric in ("mae", "rmse", "normalized_rmse"):
+                row.update({f"{metric}_{field}": None for field in FIELDS})
+            if unstable_at is None:
+                # Compare step h against the stored solver state at start + h.
+                expected = np.stack([store.trajs[run, start + step] for run in ids])
+                totals = ErrorTotals(std)
+                totals.update(prediction, expected)
+                metrics = totals.finish()
+                row["primary"] = metrics["primary"]
+                for metric in ("mae", "rmse", "normalized_rmse"):
+                    row.update({f"{metric}_{field}": metrics[metric][i] for i, field in enumerate(FIELDS)})
+                for i, run in enumerate(ids):
+                    item = ErrorTotals(std)
+                    item.update(prediction[i:i + 1], expected[i:i + 1])
+                    per_trajectory.append({"model": name, "horizon": step, "id": run, **item.finish()})
+                if name == "cnn" and step == max(horizons):
+                    # Only make the final-horizon heatmap when that prediction is actually finite.
+                    # If a rollout failed earlier, there is no valid comparison.png for that horizon.
+                    save_comparison(expected[0], prediction[0], output / "comparison.png", step)
+                    comparison_saved = True
+            rows.append(row)
+    write_csv(output / "rollout.csv", rows)
+    write_json(output / "rollout_per_trajectory.json", per_trajectory)
+    plot_rollouts(rows, output / "rollout.png")
+    return rows, comparison_saved
 
-    matplotlib.use("Agg")
-    from matplotlib import pyplot as plt
 
-    figure, axes = plt.subplots(3, 3, figsize=(12, 9), layout="constrained")
-    for channel, name in enumerate(("u", "v", "p")):
-        truth = expected[channel].astype(np.float64)
-        estimate = predicted[channel].astype(np.float64)
-        minimum = min(float(truth.min()), float(estimate.min()))
-        maximum = max(float(truth.max()), float(estimate.max()))
-        for row, (label, field) in enumerate((("Solver", truth), ("Model", estimate))):
-            plotted = axes[row, channel].imshow(
-                field, origin="lower", cmap="coolwarm", vmin=minimum, vmax=maximum
-            )
-            axes[row, channel].set_title(f"{label}: {name}")
-            figure.colorbar(plotted, ax=axes[row, channel], shrink=0.8)
-        plotted = axes[2, channel].imshow(
-            np.abs(estimate - truth), origin="lower", cmap="magma", vmin=0
-        )
-        axes[2, channel].set_title(f"Absolute error: {name}")
-        figure.colorbar(plotted, ax=axes[2, channel], shrink=0.8)
-    figure.suptitle(f"First unseen trajectory after {horizon} model steps")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(path, dpi=150)
-    plt.close(figure)
-    print(f"Saved comparison: {path.resolve()}")
+def benchmark(models, store, run, start, device, repeats):
+    """Single-state wall time including host/device transfers, with warmup."""
+    # Optional evaluation step. Repeat one fixed input so we measure prediction/solver latency,
+    # not model training, data generation, or an entire evolving trajectory.
+    state = store.trajs[run, start].copy()[None]
+    parameters = store.parameters[run:run + 1]
+    solver = NavierStokesSolver(SolverConfig(**store.metadata["trajectories"][run]["config"]))
+    reference = FluidState.from_array(state[0])
+    functions = {name: (lambda model=model: predict(model, state, parameters, device, 1))
+                 for name, model in models.items()}
+    functions["solver"] = lambda: solver.step(reference)
+    results = []
+    for name, function in functions.items():
+        # Warm up first: the first call can include GPU initialization or kernel setup.
+        for _ in range(5):
+            function()
+        durations = []
+        for _ in range(repeats):
+            if device == "cuda":
+                torch.cuda.synchronize()
+            # Synchronize GPU work before/after timing so we do not just time queuing it.
+            begin = time.perf_counter()
+            function()
+            if device == "cuda":
+                torch.cuda.synchronize()
+            durations.append(time.perf_counter() - begin)
+        results.append({"method": name, "median_seconds_per_step": float(np.median(durations)),
+                        "repeats": repeats, "batch_size": 1})
+    return results
+
+
+def evaluate_run(args):
+    # Main evaluation work, called by main. Only the already-selected development refits
+    # are allowed here; tuning against these final-test results would leak test information.
+    run_path = Path(args.run).resolve()
+    info = json.loads((run_path / "run.json").read_text(encoding="utf-8"))
+    if info["status"] != "complete":
+        raise ValueError("Complete cross-validation and development refitting before final evaluation.")
+    store = TrajectoryStore(args.data or info["data_path"])
+    if store.metadata["dataset_id"] != info["dataset_id"] or store.splits != info["splits"]:
+        # Same file location is not enough: its dataset identity and split IDs must agree too.
+        raise ValueError("Dataset/splits differ from the frozen training run.")
+    if args.verify_data:
+        store.verify_content()
+    if args.rollout_start < 0 or args.rollout_start + max(args.horizons) > store.num_steps:
+        raise ValueError(f"Rollouts must fit within the {store.num_steps} stored transitions.")
+    device = resolve_device(args.device)
+    torch.set_num_threads(args.threads)
+    output = Path(args.output).resolve() if args.output else run_path / "test"
+    if output.exists() and any(output.iterdir()) and not args.repeat:
+        raise FileExistsError(f"Evaluation already exists: {output}. --repeat explicitly reruns the final test.")
+    models = {"persistence": None}
+    # Load the final CNN/ridge, not the individual fold models or whichever weights ran last.
+    for name in ("cnn", "ridge"):
+        model, metadata = load_predictor(run_path / "final" / name / "best.pt", device)
+        if (metadata.get("dataset_id") != info["dataset_id"]
+                or sorted(metadata["train_ids"]) != sorted(store.splits["development"])
+                or metadata["validation_ids"]
+                or metadata["config"] != info["selected"][name]["config"]):
+            raise ValueError(f"{name} checkpoint does not match the frozen development refit.")
+        models[name] = model
+    std = models["cnn"].field_std.detach().cpu().numpy().reshape(3)
+    # Use one shared development-set scale for all final-test methods, including persistence.
+    if not np.allclose(std, models["ridge"].field_std.detach().cpu().numpy().reshape(3)):
+        raise ValueError("Models must share development-set normalization for comparison.")
+    output.mkdir(parents=True, exist_ok=True)
+    ids = store.splits["test"]
+    scores = {name: score(model, store, ids, std, device, args.batch_size) for name, model in models.items()}
+    # These one-step scores average all true-state -> next-state pairs in the test trajectories.
+    rows = []
+    for name, metrics in scores.items():
+        baseline = scores["persistence"]["primary"]
+        # Relative reduction in normalized error. A negative improvement means worse than persistence.
+        row = {"model": name, "primary": metrics["primary"],
+               "improvement_percent": 100 * (1 - metrics["primary"] / baseline) if baseline > 0 else None}
+        for metric in ("mse", "mae", "rmse", "normalized_rmse"):
+            row.update({f"{metric}_{field}": metrics[metric][i] for i, field in enumerate(FIELDS)})
+        rows.append(row)
+        print(f"{name:<12} final-test NRMSE={metrics['primary']:.6g}; per-field RMSE={metrics['rmse']}", flush=True)
+    write_csv(output / "one_step.csv", rows)
+    rollout_rows, comparison_saved = rollouts(models, store, ids, std, args.rollout_start,
+                                             sorted(set(args.horizons)), device, args.batch_size, output)
+    # Timing is optional; using 0 repeats skips it without affecting prediction metrics.
+    timings = benchmark(models, store, ids[0], args.rollout_start, device, args.benchmark_repeats) if args.benchmark_repeats else []
+    if timings:
+        write_csv(output / "timing.csv", timings)
+    result = {"dataset_id": info["dataset_id"], "test_ids": ids, "environment": environment(device),
+              "arguments": vars(args), "one_step": scores, "rollouts": rollout_rows,
+              "normalization_std": std.tolist(), "timings": timings,
+              "timing_protocol": "Batch 1, five warmups; wall time includes transfers; NumPy solver float64, models float32.",
+              "comparison_saved": comparison_saved}
+    write_json(output / "results.json", result)
+    if args.save_plot and comparison_saved:
+        import shutil
+        target = Path(args.save_plot)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.resolve() != (output / "comparison.png").resolve():
+            shutil.copyfile(output / "comparison.png", target)
+    print(f"Saved final-test tables, per-trajectory results and plots to {output}", flush=True)
+    return result
 
 
 def main():
+    # Command-line entry: validate sizes/horizons before opening the final test and writing outputs.
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--checkpoint", type=Path,
-        default=Path(__file__).resolve().parents[1] / "weights" / "newest_model.pt",
-    )
-    parser.add_argument("--seed", type=int, default=4, help="Training currently uses seed 3.")
-    parser.add_argument("--runs", type=int, default=5)
-    parser.add_argument("--steps", type=int, default=250)
+    parser.add_argument("--run", default=str(DEFAULT_RUN))
+    parser.add_argument("--data", help="Override the recorded dataset path after moving the artifacts.")
+    parser.add_argument("--output", help="Default: <run>/test")
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--rollout-start", type=int, default=25)
-    parser.add_argument("--rollout-steps", type=int, default=50)
-    parser.add_argument("--device", choices=("cpu", "cuda"), default=None)
-    parser.add_argument("--save-plot", type=Path)
+    parser.add_argument("--rollout-start", type=int, default=0)
+    parser.add_argument("--horizons", type=int, nargs="+", default=[1, 10, 25, 50, 100])
+    parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--benchmark-repeats", type=int, default=0)
+    parser.add_argument("--verify-data", action="store_true")
+    parser.add_argument("--repeat", action="store_true", help="Explicitly permit repeating final-test evaluation.")
+    parser.add_argument("--save-plot", help="Also copy the CNN comparison plot to this path.")
     args = parser.parse_args()
-    for name in ("runs", "steps", "batch_size", "rollout_steps"):
-        if getattr(args, name) < 1:
-            parser.error(f"--{name.replace('_', '-')} must be positive")
-    if args.rollout_start < 0 or args.rollout_start + args.rollout_steps > args.steps:
-        parser.error("rollout-start must be nonnegative and rollout must fit within --steps")
-    if not args.checkpoint.is_file():
-        parser.error(f"Checkpoint not found: {args.checkpoint}")
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    if device == "cuda" and not torch.cuda.is_available():
-        parser.error("CUDA is unavailable; use --device cpu")
-
-    config = SolverConfig()
-    solver = NavierStokesSolver(config)
-    rng = np.random.default_rng(args.seed)
-    print(f"Generating {args.runs} test trajectories; seed={args.seed}, noise=0", flush=True)
-    print("Using the same solver parms, random-state amplitude (0.1) as training.")
-    if args.seed == 3:
-        print("Seed 3 matches current training data; this is not a held-out evaluation.")
-    trajectories = []
-    for _ in range(args.runs):
-        initial = make_random_initial_state(solver, rng, amplitude=0.1)
-        states = solver.run(initial, args.steps)
-        trajectories.append(np.stack([state.to_array() for state in states]))
-    trajectories = np.asarray(trajectories, dtype=np.float32)
-    if not np.isfinite(trajectories).all():
-        raise ValueError("The generated reference trajectories contain nonfinite values.")
-
-    shape = trajectories.shape[2:]
-    inputs = trajectories[:, :-1].reshape(-1, *shape)
-    targets = trajectories[:, 1:].reshape(-1, *shape)
-    print(f"Loading {args.checkpoint.name}; device={device}", flush=True)
-    model = FluidModel(torch.Size(shape))
-    model.load(str(args.checkpoint))
-    model.to(device)
-    model.eval()
-
-    model_error = np.zeros(3)
-    baseline_error = np.zeros(3)
-    with torch.inference_mode():
-        for start in range(0, len(inputs), args.batch_size):
-            batch = inputs[start:start + args.batch_size]
-            expected = targets[start:start + args.batch_size]
-            predicted = model(torch.from_numpy(batch).to(device)).cpu().numpy().reshape(batch.shape)
-            if not np.isfinite(predicted).all():
-                raise ValueError("One-step predictions contain nonfinite values.")
-            model_error += field_mse(predicted, expected) * len(batch)
-            baseline_error += field_mse(batch, expected) * len(batch)
-        model_error /= len(inputs)
-        baseline_error /= len(inputs)
-
-        print(f"\nOne-step MSE across {len(inputs)} test transitions (lower is better)")
-        print(f"{'Field':<10}{'Model':>15}{'No-change baseline':>22}")
-        for name, learned, baseline in zip(("u", "v", "p", "Overall"),
-                                          [*model_error, model_error.mean()],
-                                          [*baseline_error, baseline_error.mean()]):
-            print(f"{name:<10}{learned:>15.6g}{baseline:>22.6g}")
-        if baseline_error.mean() > 0:
-            improvement = 100 * (1 - model_error.mean() / baseline_error.mean())
-            print(f"Overall improvement over no change: {improvement:.2f}% (negative means worse)")
-
-        initial = trajectories[:, args.rollout_start]
-        prediction = torch.from_numpy(initial).to(device)
-        predicted = initial
-        completed_steps = 0
-        horizons = {1, 10, 25, args.rollout_steps}
-        print(f"\nRollout from solver timestep {args.rollout_start}; feeding predictions back into model")
-        print(f"{'Steps':<10}{'Model MSE':>15}{'No-change MSE':>22}")
-        for step in range(1, args.rollout_steps + 1):
-            prediction = model(prediction)
-            next_prediction = prediction.cpu().numpy().reshape(initial.shape)
-            if not np.isfinite(next_prediction).all():
-                print(f"UNSTABLE: nonfinite predictions after {step} model steps.")
-                print(f"Stopped at the last finite prediction (step {completed_steps}).")
-                break
-            predicted = next_prediction
-            completed_steps = step
-            if step in horizons:
-                expected = trajectories[:, args.rollout_start + step]
-                learned = field_mse(predicted, expected).mean()
-                baseline = field_mse(initial, expected).mean()
-                print(f"{step:<10}{learned:>15.6g}{baseline:>22.6g}")
-
-    if args.save_plot is not None:
-        expected = trajectories[0, args.rollout_start + completed_steps]
-        save_comparison(expected, predicted[0], args.save_plot, completed_steps)
+    if min(args.batch_size, args.threads, *args.horizons) < 1 or args.benchmark_repeats < 0:
+        parser.error("Sizes/horizons must be positive; benchmark repeats must be nonnegative.")
+    try:
+        evaluate_run(args)
+    except (ValueError, FileNotFoundError, FileExistsError, FloatingPointError) as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":

@@ -1,2 +1,5 @@
 weights
 __pycache__
+.venv/
+artifacts/
+*.pyc

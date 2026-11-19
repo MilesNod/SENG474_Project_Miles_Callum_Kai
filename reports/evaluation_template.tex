@@ -1,0 +1,109 @@
+\documentclass[sigconf]{acmart}
+\setcopyright{none}
+\settopmatter{printacmref=false,printfolios=false}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\acmDOI{}
+\acmISBN{}
+\acmConference[SENG 474]{SENG 474 Evaluation}{University of Victoria}{Canada}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\begin{document}
+\title{Evaluating a Convolutional Surrogate for Lid-Driven Cavity Flow}
+@@AUTHORS@@
+\begin{abstract}
+We evaluate a convolutional neural network that predicts the next horizontal
+velocity, vertical velocity, and pressure fields of a numerical cavity solver.
+We compare it with persistence and a local ridge regressor using independent
+simulation trajectories, grouped cross-validation, and a reserved final test set.
+One-step errors and autoregressive rollouts measure predictive accuracy and
+error accumulation. These experiments assess agreement with the chosen solver,
+not independent validation of the underlying physical flow.
+\end{abstract}
+\keywords{fluid simulation, regression, convolutional neural networks, cross-validation}
+\maketitle
+\section{Research Questions}
+\textbf{RQ1:} How accurately does the CNN predict the next fluid state compared
+with persistence and local ridge regression? We compare final-test errors after
+selecting configurations on development data.
+\textbf{RQ2:} How do hidden width and learning rate affect CNN performance?
+We compare configurations using identical trajectory folds.
+\textbf{RQ3:} How does error accumulate when predictions are repeatedly fed back
+into each method? We measure error at fixed rollout horizons from unseen starts.
+@@LEARNINGRQ@@
+
+\section{Dataset}
+@@DATASET@@
+Initial conditions contain random or spatially smoothed velocities; pressure
+starts at zero and the moving lid is applied by the first solver step. These
+synthetic velocities are not guaranteed divergence-free. We reject nonfinite
+reference trajectories and screen the advective CFL number against one, in
+addition to the solver's diffusion timestep check. These checks do not establish
+numerical accuracy. Full seeds, physical configurations, descriptive channel
+statistics, and content checksums accompany the reproducible dataset.
+
+\section{Baselines and Experimental Setup}
+Persistence predicts $S_{t+1}=S_t$. Our local ridge regressor~\cite{ridge} predicts a signed
+state increment from a shared $5\times5$ stencil. The CNN uses two $3\times3$
+convolutions, a hidden ReLU, and a linear signed output, also predicting an
+increment. Both learned methods receive normalized $u,v,p$, spatial coordinates,
+viscosity, and lid speed; both have a $5\times5$ receptive-field extent. Ridge is
+implemented using NumPy normal equations and a PyTorch convolution; the CNN uses
+PyTorch~\cite{pytorch} and Adam~\cite{adam}. Ridge's pixel sampling budget is reported below.
+
+@@SETUP@@
+For field $c$, the primary metric is
+$E=\frac13\sum_{c\in\{u,v,p\}}\mathrm{RMSE}_c/\sigma_c$, where $\sigma_c$ is
+computed from training input states only. We also retain per-field MAE and MSE.
+Training minimizes mean normalized squared error; checkpoint selection minimizes
+validation $E$. Raw pressure and velocity errors are reported separately because
+they have different units. CV variation describes fold variability, not a
+confidence interval. @@REPO@@
+
+% Deliberately start the results on page 2. The packaging command checks the
+% compiled page count; edit/condense the narrative if the draft exceeds 2 pages.
+\clearpage
+\section{Results and Discussion}
+\subsection{RQ1: Comparative Prediction Performance}
+@@CVTABLE@@
+@@TESTTABLE@@
+@@COMPARISON@@
+
+\subsection{RQ2: Hyperparameter Sensitivity}
+@@SENSITIVITY@@
+\begin{figure}[ht]
+\centering
+\includegraphics[width=\columnwidth]{hyperparameters.png}
+\caption{Development CV mean and fold standard deviation for CNN configurations.}
+\end{figure}
+
+\subsection{RQ3: Autoregressive Error}
+@@ROLLOUT@@
+\begin{figure}[ht]
+\centering
+\includegraphics[width=\columnwidth]{rollout.png}
+\caption{Final-test rollout error. Nonfinite failures, if present, are recorded in the results tables.}
+\end{figure}
+@@LEARNINGRESULT@@
+
+\subsection{Limitations and Reproducibility}
+These results apply to the saved synthetic parameter distribution and numerical
+solver~\cite{solver}. Testing new starts does not establish extrapolation to unseen physical
+regimes, grids, or real fluids. We use one initialization seed per fold; fold
+variation includes different training partitions and seeds. Reasons for model
+differences require additional controlled experiments. Complete measurements,
+per-trajectory errors, checkpoints, histories, splits, and environment versions
+are saved alongside this report. @@TIMING@@
+
+\begin{thebibliography}{4}
+\bibitem{ridge} A. E. Hoerl and R. W. Kennard. 1970. Ridge Regression:
+Biased Estimation for Nonorthogonal Problems. \textit{Technometrics} 12(1), 55--67.
+\url{https://doi.org/10.1080/00401706.1970.10488634}.
+\bibitem{adam} D. P. Kingma and J. Ba. 2014. Adam: A Method for Stochastic
+Optimization. \url{https://arxiv.org/abs/1412.6980}.
+\bibitem{pytorch} PyTorch contributors. PyTorch documentation.
+\url{https://docs.pytorch.org/docs/stable/}.
+\bibitem{solver} Project numerical solver, \texttt{src/simulation/solver.py}.
+Numerical example attribution retained in source:
+\url{https://www.youtube.com/watch?v=BQLvNLgMTQE}.
+\end{thebibliography}
+\end{document}

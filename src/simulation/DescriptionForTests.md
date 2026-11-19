@@ -67,7 +67,7 @@ lid speeds or initial velocities. No new CFL rule or numerical scheme is added.
 
 ## Baseline verification
 
-`tests/_baseline.py` reads the current `nav-stokes-equation-solver/nav-stokes-eq.py`
+`tests/_baseline.py` reads the current `Nav-Stokes-Solver-From-CodeAlong/nav-stokes-eq.py`
 and executes its numerical statements, removing imports/final plotting and
 appending a return of the computed arrays. Its equations are not rewritten or
 replaced with the new solver. Only the run constants are set from the test
